@@ -3,11 +3,9 @@ from modules import script_callbacks, shared, sd_hijack
 from modules.shared import cmd_opts
 import torch, os
 from modules.textual_inversion.textual_inversion import Embedding
-import collections, math, random
+import collections
 
 EXTENSION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-EMB_SAVE_EXT = '.pt'  # '.bin'
 
 
 # -------------------------------------------------------------------------------
@@ -121,14 +119,12 @@ def do_make_it(*args):
     method = args[4]
     filetype = args[5]
 
-
-
     results = []
     details = []
-    details_end = []
+    pancakes = []
 
     if save_name == '':
-        return 'Filename is empty', ''
+        return 'Filename is empty', '', ''
     save_filename_st = os.path.join(cmd_opts.embeddings_dir, f"{save_name}.safetensors")
     save_filename_pt = os.path.join(cmd_opts.embeddings_dir, f"{save_name}.pt")
     save_filename = os.path.join(cmd_opts.embeddings_dir, f"{save_name}.{filetype}")
@@ -137,7 +133,7 @@ def do_make_it(*args):
     file_exists = os.path.exists(save_filename_st) or os.path.exists(save_filename_pt)
     if file_exists:
         if not do_overwrite:
-            return f'Embedding already exists, use "overwrite" option to overwrite it', ''
+            return f'Embedding already exists, use "overwrite" option to overwrite it', '', ''
         else:
             results.append('File already exists, overwrite overwriting it')
             # remove other if filename is different
@@ -148,9 +144,20 @@ def do_make_it(*args):
 
     tokenizer, internal_embs, loaded_embs = get_data()
     # list of tokens, they normally get a # prefix
-    token_ids = text_to_emb_ids(prompt, tokenizer)
+    # token_ids = text_to_emb_ids(prompt, tokenizer)
+    # details.append(f'Loaded embeddings: {len(loaded_embs)}')
+    # for k in loaded_embs.keys():
+    #     details.append(f'  {k}')
+    # todo split by embeddings if they exist
+    # Merge tokens so words stack together
+    words_token_splits = [text_to_emb_ids(x.strip(), tokenizer) for x in prompt.split(',')]
+    max_token_size = max([len(x) for x in words_token_splits])
+    total_tokens = sum([len(x) for x in words_token_splits])
 
-    details.append(f'Your prompt generated {len(token_ids)} tokens')
+    # we dont want to split words, expand requested token to fit largest tokenized word
+    out_num_tokens = max(num_tokens, max_token_size)
+
+    details.append(f'Your prompt generated {total_tokens} tokens')
 
     anything_saved = False
 
@@ -158,43 +165,78 @@ def do_make_it(*args):
     out_vec = None
     out_vec_list = []
     cur_index = 0
-    for k in range(len(token_ids)):
-        name = f'#{token_ids[k]}'.strip().lower()
+    tokens_in_pancake = []
+    for word_token_ids in words_token_splits:
+        # build token vector for phrase
+        phrase_vector = None
+        word_embed_names = []
+        word_embed_ids = []
+        for k in range(len(word_token_ids)):
+            name = f'#{word_token_ids[k]}'.strip().lower()
 
-        mixval = 1  # multiplier for this embedding
-        if (name == '') or (mixval == 0):
+            if name == '':
+                continue
+
+            emb_name, emb_id, emb_vec, loaded_emb = get_embedding_info(name)
+            token_vec = emb_vec.to(device='cpu', dtype=torch.float32)
+            if phrase_vector is None:
+                phrase_vector = token_vec
+            else:
+                phrase_vector = torch.cat((phrase_vector, token_vec), 0)
+
+            word_embed_names.append(emb_name)
+            word_embed_ids.append(emb_id)
+
+        if phrase_vector is None:
             continue
 
-        emb_name, emb_id, emb_vec, loaded_emb = get_embedding_info(name)
-        token_vec = emb_vec.to(device='cpu', dtype=torch.float32)
+        phrase_vectors = phrase_vector.shape[0]
 
-        token_vectors = token_vec.shape[0]
+        # make sure we can fit the phrase vector
+        if cur_index + phrase_vectors > out_num_tokens:
+            # we cant fit the phrase vector, so we need to make a new pancake
+            out_vec_list.append(out_vec.unsqueeze(0))
+            out_vec = torch.zeros(out_num_tokens, phrase_vector.shape[1]).to(device='cpu', dtype=torch.float32)
+            cur_index = 0
+            pancakes.append(', '.join(tokens_in_pancake))
+            tokens_in_pancake = []
+
         # create our tot_vec if it is none
         if out_vec is None:
-            # vectors are shape of (num_tokens, 768/1024) depending on clip version
-            out_vec = torch.zeros(num_tokens, token_vec.shape[1]).to(device='cpu', dtype=torch.float32)
+            # vectors are shape of (out_num_tokens, 768/1024) depending on clip version
+            out_vec = torch.zeros(out_num_tokens, phrase_vector.shape[1]).to(device='cpu', dtype=torch.float32)
 
-        details.append(f' - {emb_name} ({str(emb_id)}) - {token_vectors} token{"" if token_vectors == 1 else "s"} -> l:{len(out_vec_list)}, p:{cur_index}')
+        details.append(
+            f' - {"".join(word_embed_names)} ({",".join([str(x) for x in word_embed_ids])}) - {phrase_vectors} token{"" if phrase_vectors == 1 else "s"} -> l:{len(out_vec_list)}, p:{cur_index}')
+        tokens_in_pancake.append(f'{"".join(word_embed_names)}')
 
         # walk each vector one by one
-        for v in range(token_vec.shape[0]):
-            out_vec[cur_index] += token_vec[v]
+        for v in range(phrase_vector.shape[0]):
+            out_vec[cur_index] += phrase_vector[v]
             # increase index
             cur_index += 1
-            if cur_index >= num_tokens:
+            if cur_index >= out_num_tokens:
                 # reached the end, reset back to the start
                 cur_index = 0
                 out_vec_list.append(out_vec.unsqueeze(0))
                 out_vec = None
+                pancakes.append(', '.join(tokens_in_pancake))
+                tokens_in_pancake = []
 
     # add remaining vectors
     if out_vec is not None:
         out_vec_list.append(out_vec.unsqueeze(0))
+    if len(tokens_in_pancake) > 0:
+        pancakes.append(', '.join(tokens_in_pancake))
 
     results.append(f"Total embedding stacks: {len(out_vec_list)}")
     stacked_vec = torch.cat(out_vec_list, dim=0)
     if method == 'mean':
         tot_vec = torch.mean(stacked_vec, dim=0)
+    elif method == 'cosine':
+        # calculate cosine similarity
+        tot_vec = torch.mean(stacked_vec, dim=0)
+        tot_vec = tot_vec / torch.norm(tot_vec, dim=0)
     else:
         # assume sum
         tot_vec = torch.sum(stacked_vec, dim=0)
@@ -227,7 +269,15 @@ def do_make_it(*args):
 
         results.append('Your embedding is ready to use!')
 
-    return '\n'.join(results), '\n'.join(details)
+        if out_num_tokens > num_tokens:
+            results.append(f'\nNote: Your embedding was expanded to {out_num_tokens} tokens to fit the largest phrase')
+            results.append(f'You can change this by adding more commas (,) to split your prompt into more phrases')
+
+    pancakes_string = '\n'.join([f"{i + 1}: {pancakes[i]}" for i in range(len(pancakes))])
+    # replace </w> with space
+    pancakes_string = pancakes_string.replace('</w>', ' ')
+
+    return '\n'.join(results), '\n'.join(details), pancakes_string
 
 
 # -------------------------------------------------------------------------------
@@ -248,12 +298,21 @@ def add_tab():
                     prompt_input = gr.Textbox(
                         label="Your Prompt Here",
                         lines=4,
-                        placeholder="Enter a prompt here. It can be as long as you want. It can include other embeddings. It cannot handle weight modifiers yet like (this). Then click 'Make it!'",
+                        placeholder="Enter a prompt here. It can be as long as you want. It cannot handle weight modifiers yet like (this) or embeddings, yet. Then click 'Make it!'",
                     )
 
                     with gr.Row():
                         save_name_input = gr.Textbox(label="Filename", lines=1,
                                                      placeholder='Embedding Name (without extension)')
+                        overwrite_checkbox = gr.Checkbox(value=False, label="Overwrite if exists")
+                    with gr.Row():
+                        method_selector = gr.Dropdown(
+                            label="Method",
+                            choices=['mean', 'sum', 'cosine'],
+                            value='sum',
+                            variant='secondary',
+                            info="How to combine the stacks of tokens into a single embedding."
+                        )
                         num_tokens_slider = gr.Slider(
                             minimum=1,
                             maximum=74,
@@ -262,27 +321,23 @@ def add_tab():
                             label="Num Tokens",
                             info="The number of tokens your embedding will consume."
                         )
-                    with gr.Row():
-                        method_selector = gr.Dropdown(
-                            label="Method",
-                            choices=['mean', 'sum'],
-                            value='sum',
-                            variant='secondary',
-                            info="How to combine the stacks of tokens into a single embedding."
-                        )
+                        # safetensors doesn't work yet
                         filetype_selector = gr.Dropdown(
                             label="Filetype",
                             choices=['pt', 'safetensors'],
                             value='pt',
                             variant='secondary',
-                            info="The file format to save the embedding in."
+                            info="The file format to save the embedding in.",
+                            visible=False  # need to fix safetensors
                         )
                     with gr.Row():
                         make_it_button = gr.Button(value="Make It!", variant="primary")
-                        overwrite_checkbox = gr.Checkbox(value=False, label="Overwrite if exists")
+
                     with gr.Row():
-                        save_result_output = gr.Textbox(label="Output", lines=8)
-                        save_result_details = gr.Textbox(label="Details", lines=8)
+                        save_result_output = gr.Textbox(label="Output", lines=8, max_lines=8, readonly=True)
+                        save_result_details = gr.Textbox(label="Details", lines=8, max_lines=8, readonly=True)
+                    with gr.Row():
+                        stack_details = gr.Textbox(label="Pancakes", lines=4, max_lines=4, readonly=True)
 
                 with gr.Column(variant='panel'):
                     html_output = gr.HTML(
@@ -298,10 +353,10 @@ def add_tab():
                     prompt_input, save_name_input, num_tokens_slider, overwrite_checkbox,
                     method_selector, filetype_selector
                 ],
-                outputs=[save_result_output, save_result_details]
+                outputs=[save_result_output, save_result_details, stack_details]
             )
 
-    return [(ui, "Prompt Embedder", "prompt_to_embedding")]
+    return [(ui, "Prompt Embedder", "prompt_embedder")]
 
 
 script_callbacks.on_ui_tabs(add_tab)
